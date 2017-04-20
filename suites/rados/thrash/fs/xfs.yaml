@@ -1,0 +1,7 @@
+overrides:
+  ceph:
+    fs: xfs
+    cluster: xtao
+    conf:
+      osd:
+        osd sloppy crc: true

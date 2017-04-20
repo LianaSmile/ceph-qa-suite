@@ -1,0 +1,80 @@
+Branch: master
+check-locks: false
+cluster: xtao
+email: null
+job_id: '10'
+last_in_suite: false
+log-rotate:
+  ceph-mds: 1.0G
+  ceph-osd: 2.5G
+machine_type: plana
+name: test_xtao_clear
+nuke-on-error: false
+
+os_type: centos
+os_version: "7.1"
+overrides:
+  admin_socket:
+    branch: master
+  ceph:
+    cluster: xtao
+    conf:
+      client:
+        debug client: 2
+        debug ms: 1
+      mds:
+        debug mds: 2
+        debug ms: 1
+      mon:
+        debug mon: 20
+        debug ms: 1
+        debug paxos: 20
+      osd:
+        debug filestore: 20
+        debug journal: 20
+        debug ms: 1
+        debug osd: 25
+        osd sloppy crc: true
+    fs: xfs
+    log-whitelist:
+    - slow request
+  ceph-deploy:
+    conf:
+      client:
+        log file: /var/log/ceph/xtao-$name.$pid.log
+      mon:
+        debug mon: 1
+        debug ms: 20
+        debug paxos: 20
+        osd default pool size: 2
+  workunit: {}
+owner: test_liyan_deploy@ubuntu
+priority: 1000
+
+
+roles:
+- [client.1, xtao.mds.xt2, xtao.osd.1, xtao.osd.3]
+- [xtao.mon.xt1, client.0, xtao.mds.xt1, xtao.osd.0, xtao.osd.2]
+
+tasks:
+# clear disk ceph
+# disk leave clear
+- pexec:
+    all:
+      - for i in $(xtcli disk list | grep xtao|awk '{print $4}');do xtcli disk leave $i -y;xtcli disk clear $i -y;done
+      - for i in $(docker ps -a|grep ceph|grep -v mon);do docker stop $i;docker rm $i;done
+      - for i in $(docker ps -a|grep mon|awk '{print $11}');do systemctl status $i;docker stop $i;docker rm $i;done
+      - for i in $(docker ps -a|grep ceph);do docker stop $i;docker rm $i;done
+      - cd /var/lib/ceph
+      - ls|grep -v mon|xargs rm -rf $ 
+
+
+teuthology_branch: master
+tube: plana
+use_existing_cluster: true
+verbose: false
+worker_log: /home/teuthworker/archive/worker_logs/worker_liyan_xtao
+
+targets:
+  root@plana001.ceph.com: passwd nasadmin
+  root@plana002.ceph.com: passwd nasadmin

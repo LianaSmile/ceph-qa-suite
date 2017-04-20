@@ -1,0 +1,1118 @@
+"""
+#Ceph cluster task.
+Handle the setup, starting, and clean-up of a Ceph cluster.
+"""
+from cStringIO import StringIO
+
+import argparse
+import contextlib
+import errno
+import logging
+import os
+import json
+import time
+import gevent
+import socket
+
+from ceph_manager import CephManager, write_conf
+from tasks.cephfs.filesystem import Filesystem
+from teuthology import misc as teuthology
+from teuthology import contextutil
+from teuthology import exceptions
+from teuthology.orchestra import run
+import ceph_client as cclient
+from teuthology.orchestra.daemon import DaemonGroup
+
+CEPH_ROLE_TYPES = ['mon', 'mgr', 'osd', 'mds', 'rgw']
+
+log = logging.getLogger(__name__)
+
+
+def generate_caps(type_):
+    """
+    Each call will return the next capability for each system type
+    (essentially a subset of possible role values).  Valid types are osd,
+    mds and client.
+    """
+    defaults = dict(
+        osd=dict(
+            mon='allow *',
+            osd='allow *',
+        ),
+        mgr=dict(
+            mon='allow *',
+        ),
+        mds=dict(
+            mon='allow *',
+            osd='allow *',
+            mds='allow',
+        ),
+        client=dict(
+            mon='allow rw',
+            osd='allow rwx',
+            mds='allow',
+        ),
+    )
+    for subsystem, capability in defaults[type_].items():
+        yield '--cap'
+        yield subsystem
+        yield capability
+
+
+@contextlib.contextmanager
+def ceph_log(ctx, config):
+    """
+    Create /var/log/ceph log directory that is open to everyone.
+    Add valgrind and profiling-logger directories.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    log.info('Making ceph log dir writeable by non-root...')
+    run.wait(
+        ctx.cluster.run(
+            args=[
+                'sudo',
+                'chmod',
+                '777',
+                '/var/log/ceph',
+            ],
+            wait=False,
+        )
+    )
+    log.info('Disabling ceph logrotate...')
+    run.wait(
+        ctx.cluster.run(
+            args=[
+                'sudo',
+                'rm', '-f', '--',
+                '/etc/logrotate.d/ceph',
+            ],
+            wait=False,
+        )
+    )
+    log.info('Creating extra log directories...')
+    run.wait(
+        ctx.cluster.run(
+            args=[
+                'sudo',
+                'install', '-d', '-m0777', '--',
+                '/var/log/ceph/valgrind',
+                '/var/log/ceph/profiling-logger',
+            ],
+            wait=False,
+        )
+    )
+
+    class Rotater(object):
+        stop_event = gevent.event.Event()
+
+        def invoke_logrotate(self):
+            # 1) install ceph-test.conf in /etc/logrotate.d
+            # 2) continuously loop over logrotate invocation with ceph-test.conf
+            while not self.stop_event.is_set():
+                self.stop_event.wait(timeout=30)
+                try:
+                    run.wait(
+                        ctx.cluster.run(
+                            args=['sudo', 'logrotate', '/etc/logrotate.d/ceph-test.conf'
+                                  ],
+                            wait=False,
+                        )
+                    )
+                except exceptions.ConnectionLostError as e:
+                    # Some tests may power off nodes during test, in which
+                    # case we will see connection errors that we should ignore.
+                    log.debug("Missed logrotate, node '{0}' is offline".format(
+                        e.node))
+                except EOFError as e:
+                    # Paramiko sometimes raises this when it fails to
+                    # connect to a node during open_session.  As with
+                    # ConnectionLostError, we ignore this because nodes
+                    # are allowed to get power cycled during tests.
+                    log.debug("Missed logrotate, EOFError")
+                except socket.error as e:
+                    if e.errno == errno.EHOSTUNREACH:
+                        log.debug("Missed logrotate, host unreachable")
+                    else:
+                        raise
+
+        def begin(self):
+            self.thread = gevent.spawn(self.invoke_logrotate)
+
+        def end(self):
+            self.stop_event.set()
+            self.thread.get()
+
+    def write_rotate_conf(ctx, daemons):
+        testdir = teuthology.get_testdir(ctx)
+        rotate_conf_path = os.path.join(os.path.dirname(__file__), 'logrotate.conf')
+        with file(rotate_conf_path, 'rb') as f:
+            conf = ""
+            for daemon, size in daemons.iteritems():
+                # Liyan debug
+                cluster = ctx.config['cluster']
+                _, role_type = daemon.split('-')
+                log.info('writing logrotate stanza for {daemon}'.format(daemon=cluster+'-'+role_type))
+                #conf += f.read().format(daemon_type=daemon, max_size=size)
+                conf += f.read().format(daemon_type=cluster+'-'+role_type, max_size=size)
+                f.seek(0, 0)
+
+            for remote in ctx.cluster.remotes.iterkeys():
+                teuthology.write_file(remote=remote,
+                                      path='{tdir}/logrotate.ceph-test.conf'.format(tdir=testdir),
+                                      data=StringIO(conf)
+                                      )
+                remote.run(
+                    args=[
+                        'sudo',
+                        'mv',
+                        '{tdir}/logrotate.ceph-test.conf'.format(tdir=testdir),
+                        '/etc/logrotate.d/ceph-test.conf',
+                        run.Raw('&&'),
+                        'sudo',
+                        'chmod',
+                        '0644',
+                        '/etc/logrotate.d/ceph-test.conf',
+                        run.Raw('&&'),
+                        'sudo',
+                        'chown',
+                        'root.root',
+                        '/etc/logrotate.d/ceph-test.conf'
+                    ]
+                )
+                remote.chcon('/etc/logrotate.d/ceph-test.conf',
+                             'system_u:object_r:etc_t:s0')
+
+    if ctx.config.get('log-rotate'):
+        daemons = ctx.config.get('log-rotate')
+        log.info('Setting up log rotation with ' + str(daemons))
+        write_rotate_conf(ctx, daemons)
+        logrotater = Rotater()
+        logrotater.begin()
+    try:
+        yield
+
+    finally:
+        if ctx.config.get('log-rotate'):
+            log.info('Shutting down logrotate')
+            logrotater.end()
+            ctx.cluster.run(
+                args=['sudo', 'rm', '/etc/logrotate.d/ceph-test.conf'
+                      ]
+            )
+        if ctx.archive is not None and \
+                not (ctx.config.get('archive-on-error') and ctx.summary['success']):
+            # and logs
+            log.info('Compressing logs...')
+            # Liyan modified
+            pyscript = """
+from datetime import datetime
+import commands
+
+status, output = commands.getstatusoutput('ls /var/log/ceph | grep log | grep -v gz')
+print 'status = ',status
+print 'output = ',output
+for file in output.split('\\n'):
+    start_time = datetime.now()
+    create_time = start_time.strftime('%Y_%m_%d_%H_%M')
+    file_pre = file.split('.log')[0]
+    commands.getstatusoutput('gzip -c {cmd_file} > /var/log/ceph/{file_cmd_pre}_{time}.log.gz && echo > {cmd_file}'.format(cmd_file=file,file_cmd_pre=file_pre,time=create_time))
+
+            """
+            run.wait(
+                ctx.cluster.run(
+                    args=[
+                        'python',
+                        '-c',
+                        pyscript,
+                    ],
+                    wait=False,
+                ),
+            )
+
+            log.info('Archiving logs...')
+            path = os.path.join(ctx.archive, 'remote')
+            os.makedirs(path)
+            for remote in ctx.cluster.remotes.iterkeys():
+                sub = os.path.join(path, remote.shortname)
+                os.makedirs(sub)
+                teuthology.pull_directory(remote, '/var/log/ceph',
+                                          os.path.join(sub, 'log'))
+
+
+def assign_devs(roles, devs):
+    """
+    Create a dictionary of devs indexed by roles
+    :param roles: List of roles
+    :param devs: Corresponding list of devices.
+    :returns: Dictionary of devs indexed by roles.
+    """
+    return dict(zip(roles, devs))
+
+
+@contextlib.contextmanager
+def valgrind_post(ctx, config):
+    """
+    After the tests run, look throught all the valgrind logs.  Exceptions are raised
+    if textual errors occured in the logs, or if valgrind exceptions were detected in
+    the logs.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    try:
+        yield
+    finally:
+        lookup_procs = list()
+        log.info('Checking for errors in any valgrind logs...')
+        for remote in ctx.cluster.remotes.iterkeys():
+            # look at valgrind logs for each node
+            proc = remote.run(
+                args=[
+                    'sudo',
+                    'zgrep',
+                    '<kind>',
+                    run.Raw('/var/log/ceph/valgrind/*'),
+                    '/dev/null',  # include a second file so that we always get a filename prefix on the output
+                    run.Raw('|'),
+                    'sort',
+                    run.Raw('|'),
+                    'uniq',
+                ],
+                wait=False,
+                check_status=False,
+                stdout=StringIO(),
+            )
+            lookup_procs.append((proc, remote))
+
+        valgrind_exception = None
+        for (proc, remote) in lookup_procs:
+            proc.wait()
+            out = proc.stdout.getvalue()
+            for line in out.split('\n'):
+                if line == '':
+                    continue
+                try:
+                    (file, kind) = line.split(':')
+                except Exception:
+                    log.error('failed to split line %s', line)
+                    raise
+                log.debug('file %s kind %s', file, kind)
+                if (file.find('mds') >= 0) and kind.find('Lost') > 0:
+                    continue
+                log.error('saw valgrind issue %s in %s', kind, file)
+                valgrind_exception = Exception('saw valgrind issues')
+
+        if config.get('expect_valgrind_errors'):
+            if not valgrind_exception:
+                raise Exception('expected valgrind issues and found none')
+        else:
+            if valgrind_exception:
+                raise valgrind_exception
+
+
+@contextlib.contextmanager
+def crush_setup(ctx, config):
+    cluster_name = config['cluster']
+    first_mon = teuthology.get_first_mon(ctx, config, cluster_name)
+    (mon_remote,) = ctx.cluster.only(first_mon).remotes.iterkeys()
+
+    profile = config.get('crush_tunables', 'default')
+    log.info('Setting crush tunables to %s', profile)
+    mon_remote.run(
+        args=['sudo', 'ceph', '--cluster', cluster_name,
+              'osd', 'crush', 'tunables', profile])
+    yield
+
+
+@contextlib.contextmanager
+def cephfs_setup(ctx, config):
+    cluster_name = config['cluster']
+    testdir = teuthology.get_testdir(ctx)
+    coverage_dir = '{tdir}/archive/coverage'.format(tdir=testdir)
+
+    first_mon = teuthology.get_first_mon(ctx, config, cluster_name)
+    (mon_remote,) = ctx.cluster.only(first_mon).remotes.iterkeys()
+    mdss = ctx.cluster.only(teuthology.is_type('mds', cluster_name))
+    # If there are any MDSs, then create a filesystem for them to use
+    # Do this last because requires mon cluster to be up and running
+    if mdss.remotes:
+        log.info('Setting up CephFS filesystem...')
+
+        Filesystem(ctx, create='cephfs') # TODO: make Filesystem cluster-aware
+
+        is_active_mds = lambda role: 'mds.' in role and not role.endswith('-s') and '-s-' not in role
+        all_roles = [item for remote_roles in mdss.remotes.values() for item in remote_roles]
+        num_active = len([r for r in all_roles if is_active_mds(r)])
+        mon_remote.run(
+            args=[
+                'sudo',
+                'adjust-ulimits',
+                'ceph-coverage',
+                coverage_dir,
+                'ceph', 'mds', 'set', 'allow_multimds', 'true',
+                '--yes-i-really-mean-it'],
+	    check_status=False,  # probably old version, upgrade test
+        )
+        mon_remote.run(args=[
+            'sudo',
+            'adjust-ulimits',
+            'ceph-coverage',
+            coverage_dir,
+            'ceph',
+            '--cluster', cluster_name,
+            'mds', 'set_max_mds', str(num_active)])
+        mon_remote.run(
+            args=[
+                'sudo',
+                'adjust-ulimits',
+                'ceph-coverage',
+                coverage_dir,
+                'ceph', 'mds', 'set', 'allow_dirfrags', 'true',
+                '--yes-i-really-mean-it'],
+	    check_status=False,  # probably old version, upgrade test
+        )
+
+    yield
+
+
+@contextlib.contextmanager
+def cluster(ctx, config):
+    """
+    Handle the creation and removal of a ceph cluster.
+    On startup:
+        Create directories needed for the cluster.
+        Create remote journals for all osds.
+        Create and set keyring.
+        Copy the monmap to tht test systems.
+        Setup mon nodes.
+        Setup mds nodes.
+        Mkfs osd nodes.
+        Add keyring information to monmaps
+        Mkfs mon nodes.
+    On exit:
+        If errors occured, extract a failure message and store in ctx.summary.
+        Unmount all test files and temporary journaling files.
+        Save the monitor information and archive all ceph logs.
+        Cleanup the keyring setup, and remove all monitor map and data files left over.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    if ctx.config.get('use_existing_cluster', False) is True:
+        log.info("'use_existing_cluster' is true; skipping cluster creation")
+        #yield
+    #Peng debug
+    #if ctx.config.get('use_existing_cluster',False) is True:
+    #    log.info("peng second called in use_existing_cluster is true, so return")
+    #    return
+    import pdb;pdb.set_trace()
+
+    testdir = teuthology.get_testdir(ctx)
+    cluster_name = config['cluster']
+    if not hasattr(ctx, 'ceph'):
+        ctx.ceph = {}
+    ctx.ceph[cluster_name] = argparse.Namespace()
+
+    log.info('Create client auth...')
+    cclient.create_keyring(ctx,cluster_name)
+
+    # Liyan add blacklist new
+    import pdb;pdb.set_trace()
+    log.info('Liyan Reading logs,if blacklist in logs...')
+   
+    if config['log_blacklist'] is not None and config['log_blacklist'] != []:
+        log.info('Filter blacklist...')
+        for remote,_ in ctx.cluster.remote.iterms():
+            output = first_in_cpeh_log(remote,'/var/log/ceph/xtao.log',config['log_blacklist'],'')
+            log.info("/var/log/ceph/xtao.log  balcklist is {output}".format(output= output))
+            if output is not None:
+                ctx.summary['success'] =  False
+                log.error('Found balcklist {blacklist} in logs'.format(blacklist=config['log_blacklist']))
+                if 'failure_reason' not in ctx.summary:
+                    for pattern in config['log_blacklist']:
+                        ctx.summary['failure_reason'] = '{blacklist} in ceph log'.format(blacklist=config['log_whitelist'])
+    if config['log_whitelist'] is not None:
+       log.info('log_whitelist is {log_whitelist}') 
+
+    try:
+        yield
+    except Exception:
+        # we need to know this below
+        ctx.summary['success'] = False
+        raise
+    finally:
+       # (mon0_remote,) = ctx.cluster.only(firstmon).remotes.keys()
+        log.info('Checking cluster log for badness...')
+        import pdb;pdb.set_trace()
+        if first_in_ceph_log('/var/log/ceph/xtao-mon.xt1.log','\[ERR\]|\[WRN\]|\[SEC\]',
+                             config['log_whitelist']) is not None:
+            log.warning('Found errors (ERR|WRN|SEC) in cluster log')
+            ctx.summary['success'] = False
+            # use the most severe problem as the failure reason
+            if 'failure_reason' not in ctx.summary:
+                for pattern in ['\[SEC\]', '\[ERR\]', '\[WRN\]']:
+                    match = first_in_ceph_log(pattern, config['log_whitelist'])
+                    # Liyan debug
+                    log.info('Liyan debug ERR is in {path}'.format(path='/var/log/ceph/xtao-mon.xt1.log'))
+                    if match is not None:
+                        ctx.summary['failure_reason'] = \
+                            '"{match}" in cluster log'.format(
+                                match=match.rstrip('\n'),
+                            )
+                        break
+
+        for remote, dirs in devs_to_clean.iteritems():
+            for dir_ in dirs:
+                log.info('Unmounting %s on %s' % (dir_, remote))
+                try:
+                    remote.run(
+                        args=[
+                            'sync',
+                            run.Raw('&&'),
+                            'sudo',
+                            'umount',
+                            '-f',
+                            dir_
+                        ]
+                    )
+                except Exception as e:
+                    remote.run(args=[
+                        'sudo',
+                        run.Raw('PATH=/usr/sbin:$PATH'),
+                        'lsof',
+                        run.Raw(';'),
+                        'ps', 'auxf',
+                    ])
+                    raise e
+
+        if config.get('tmpfs_journal'):
+            log.info('tmpfs journal enabled - unmounting tmpfs at /mnt')
+            for remote, roles_for_host in osds.remotes.iteritems():
+                remote.run(
+                    args=['sudo', 'umount', '-f', '/mnt'],
+                    check_status=False,
+                )
+
+        if ctx.archive is not None and \
+                not (ctx.config.get('archive-on-error') and ctx.summary['success']):
+
+            # archive mon data, too
+            log.info('Archiving mon data...')
+            path = os.path.join(ctx.archive, 'data')
+            try:
+                os.makedirs(path)
+            except OSError as e:
+                if e.errno == errno.EEXIST:
+                    pass
+                else:
+                    raise
+            for remote, roles in mons.remotes.iteritems():
+                for role in roles:
+                    is_mon = teuthology.is_type('mon', cluster_name)
+                    if is_mon(role):
+                        _, _, id_ = teuthology.split_role(role)
+                        mon_dir = '/var/lib/ceph/mon/' + \
+                                  '{0}-{1}'.format(cluster_name, id_)
+                        teuthology.pull_directory_tarball(
+                            remote,
+                            mon_dir,
+                            path + '/' + role + '.tgz')
+
+
+def osd_scrub_pgs(ctx, config):
+    """
+    Scrub pgs when we exit.
+    First make sure all pgs are active and clean.
+    Next scrub all osds.
+    Then periodically check until all pgs have scrub time stamps that
+    indicate the last scrub completed.  Time out if no progess is made
+    here after two minutes.
+    """
+    retries = 12
+    delays = 10
+    cluster_name = config['cluster']
+    manager = ctx.managers[cluster_name]
+    all_clean = False
+    for _ in range(0, retries):
+        states = []
+        stats = manager.get_pg_stats()
+        # Liyan debug
+        #states = [stat['state'] for stat in stats]
+        for stat in stats:
+            states.append(stat['state'])  
+
+        if len(set(states)) == 1 and states[0] == 'active+clean':
+            all_clean = True
+            break
+        log.info("Waiting for all osds to be active and clean.")
+        time.sleep(delays)
+    if not all_clean:
+        log.info("Scrubbing terminated -- not all pgs were active and clean.")
+        return
+    check_time_now = time.localtime()
+    time.sleep(1)
+    all_roles = teuthology.all_roles(ctx.cluster)
+    for role in teuthology.cluster_roles_of_type(all_roles, 'osd', cluster_name):
+        log.info("Scrubbing {osd}".format(osd=role))
+        _, _, id_ = teuthology.split_role(role)
+        manager.raw_cluster_cmd('osd', 'deep-scrub', id_)
+    prev_good = 0
+    gap_cnt = 0
+    loop = True
+    while loop:
+        stats = manager.get_pg_stats()
+        # Liyan debug
+        #timez = [stat['last_scrub_stamp'] for stat in stats]
+        timez = []
+        for stat in stats:
+            timez.append(stat['last_scrub_stamp'])
+        loop = False
+        thiscnt = 0
+        for tmval in timez:
+            pgtm = time.strptime(tmval[0:tmval.find('.')], '%Y-%m-%d %H:%M:%S')
+            if pgtm > check_time_now:
+                thiscnt += 1
+            else:
+                loop = True
+        if thiscnt > prev_good:
+            prev_good = thiscnt
+            gap_cnt = 0
+        else:
+            gap_cnt += 1
+            if gap_cnt > retries:
+                log.info('Exiting scrub checking -- not all pgs scrubbed.')
+                return
+        if loop:
+            log.info('Still waiting for all pgs to be scrubbed.')
+            time.sleep(delays)
+
+
+@contextlib.contextmanager
+def run_daemon(ctx, config, type_):
+    """
+    Run daemons for a role type.  Handle the startup and termination of a a daemon.
+    On startup -- set coverages, cpu_profile, valgrind values for all remotes,
+    and a max_mds value for one mds.
+    On cleanup -- Stop all existing daemons of this type.
+    :param ctx: Context
+    :param config: Configuration
+    :paran type_: Role type
+    """
+    cluster_name = config['cluster']
+    log.info('Starting %s daemons in cluster %s...', type_, cluster_name)
+    testdir = teuthology.get_testdir(ctx)
+    daemons = ctx.cluster.only(teuthology.is_type(type_, cluster_name))
+
+    # check whether any daemons if this type are configured
+    if daemons is None:
+        return
+    coverage_dir = '{tdir}/archive/coverage'.format(tdir=testdir)
+
+    daemon_signal = 'kill'
+    if config.get('coverage') or config.get('valgrind') is not None:
+        daemon_signal = 'term'
+
+    for remote, roles_for_host in daemons.remotes.iteritems():
+        is_type_ = teuthology.is_type(type_, cluster_name)
+        for role in roles_for_host:
+            if not is_type_(role):
+                continue
+            _, _, id_ = teuthology.split_role(role)
+
+            #Peng debug
+            #run_cmd = [
+            #    'sudo',
+            #    'adjust-ulimits',
+            #    'ceph-coverage',
+            #    coverage_dir,
+            #    'daemon-helper',
+            #    daemon_signal,
+            #]
+            run_cmd = []
+            #run_cmd_tail = [
+            #    'ceph-%s' % (type_),
+            #    '-f',
+            #    '--cluster', cluster_name,
+            #    '-i', id_]
+            run_cmd_tail = [
+                'docker',
+                'start',
+                '%s-%s.%s' % (cluster_name, type_, id_,)
+            ]
+
+            if type_ in config.get('cpu_profile', []):
+                profile_path = '/var/log/ceph/profiling-logger/%s.prof' % (role)
+                run_cmd.extend(['env', 'CPUPROFILE=%s' % profile_path])
+
+            if config.get('valgrind') is not None:
+                valgrind_args = None
+                if type_ in config['valgrind']:
+                    valgrind_args = config['valgrind'][type_]
+                if role in config['valgrind']:
+                    valgrind_args = config['valgrind'][role]
+                run_cmd = teuthology.get_valgrind_args(testdir, role,
+                                                       run_cmd,
+                                                       valgrind_args)
+
+            run_cmd.extend(run_cmd_tail)
+
+            ctx.daemons.add_daemon(remote, type_, id_,
+                                   cluster=cluster_name,
+                                   args=run_cmd,
+                                   logger=log.getChild(role),
+                                   stdin=run.PIPE,
+                                   wait=False,
+                                   )
+
+    try:
+        yield
+    finally:
+        #Peng comment if out
+        #teuthology.stop_daemons_of_type(ctx, type_, cluster_name)
+        log.info("Peng will not call stop_daemons_of_type")
+
+
+def healthy(ctx, config):
+    """
+    Wait for all osd's to be up, and for the ceph health monitor to return HEALTH_OK.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    config = config if isinstance(config, dict) else dict()
+    cluster_name = config.get('cluster', 'ceph')
+    log.info('Waiting until ceph cluster %s is healthy...', cluster_name)
+    # Liyan debug
+    firstmon = teuthology.get_first_mon(ctx, config, cluster=cluster_name)
+    (mon0_remote,) = ctx.cluster.only(firstmon).remotes.keys()
+    teuthology.wait_until_osds_up(
+        ctx,
+        cluster=ctx.cluster,
+        remote=mon0_remote,
+        ceph_cluster=cluster_name,
+    )
+    teuthology.wait_until_healthy(
+        ctx,
+        remote=mon0_remote,
+        ceph_cluster=cluster_name,
+    )
+
+    log.info('Liyan debug cluster name is {cluster_name}'.format(cluster_name=config['cluster']))
+    if ctx.cluster.only(teuthology.is_type('mds', cluster_name)).remotes:
+        # Some MDSs exist, wait for them to be healthy
+        ceph_fs = Filesystem(ctx) # TODO: make Filesystem cluster-aware
+        ceph_fs.wait_for_daemons(timeout=300)
+
+
+def wait_for_osds_up(ctx, config):
+    """
+    Wait for all osd's to come up.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    log.info('Waiting until ceph osds are all up...')
+    cluster_name = config.get('cluster', 'ceph')
+    firstmon = teuthology.get_first_mon(ctx, config, cluster_name)
+    (mon0_remote,) = ctx.cluster.only(firstmon).remotes.keys()
+    teuthology.wait_until_osds_up(
+        ctx,
+        cluster=ctx.cluster,
+        remote=mon0_remote
+    )
+
+
+def wait_for_mon_quorum(ctx, config):
+    """
+    Check renote ceph status until all monitors are up.
+    :param ctx: Context
+    :param config: Configuration
+    """
+    if isinstance(config, dict):
+        mons = config['daemons']
+        cluster_name = config.get('cluster', 'ceph')
+    else:
+        assert isinstance(config, list)
+        mons = config
+        cluster_name = 'ceph'
+    firstmon = teuthology.get_first_mon(ctx, config, cluster_name)
+    (remote,) = ctx.cluster.only(firstmon).remotes.keys()
+    with contextutil.safe_while(sleep=10, tries=60,
+                                action='wait for monitor quorum') as proceed:
+        while proceed():
+            r = remote.run(
+                args=[
+                    'sudo',
+                    'ceph',
+                    'quorum_status',
+                ],
+                stdout=StringIO(),
+                logger=log.getChild('quorum_status'),
+            )
+            j = json.loads(r.stdout.getvalue())
+            q = j.get('quorum_names', [])
+            log.debug('Quorum: %s', q)
+            if sorted(q) == sorted(mons):
+                break
+
+
+def created_pool(ctx, config):
+    """
+    Add new pools to the dictionary of pools that the ceph-manager
+    knows about.
+    """
+    for new_pool in config:
+        if new_pool not in ctx.managers['ceph'].pools:
+            ctx.managers['ceph'].pools[new_pool] = ctx.managers['ceph'].get_pool_property(
+                new_pool, 'pg_num')
+
+
+@contextlib.contextmanager
+def restart(ctx, config):
+    """
+   restart ceph daemons
+   For example::
+      tasks:
+      - ceph.restart: [all]
+   For example::
+      tasks:
+      - ceph.restart: [osd.0, mon.1, mds.*]
+   or::
+      tasks:
+      - ceph.restart:
+          daemons: [osd.0, mon.1]
+          wait-for-healthy: false
+          wait-for-osds-up: true
+    :param ctx: Context
+    :param config: Configuration
+    """
+    if config is None:
+        config = {}
+    elif isinstance(config, list):
+        config = {'daemons': config}
+
+    daemons = ctx.daemons.resolve_role_list(config.get('daemons', None), CEPH_ROLE_TYPES, True)
+    clusters = set()
+    for role in daemons:
+        cluster, type_, id_ = teuthology.split_role(role)
+        ctx.daemons.get_daemon(type_, id_, cluster).restart()
+        clusters.add(cluster)
+
+    if config.get('wait-for-healthy', True):
+        for cluster in clusters:
+            healthy(ctx=ctx, config=dict(cluster=cluster))
+    if config.get('wait-for-osds-up', False):
+        for cluster in clusters:
+            wait_for_osds_up(ctx=ctx, config=dict(cluster=cluster))
+    manager = ctx.managers['ceph']
+    for dmon in daemons:
+        if '.' in dmon:
+            dm_parts = dmon.split('.')
+            if dm_parts[1].isdigit():
+                if dm_parts[0] == 'osd':
+                    manager.mark_down_osd(int(dm_parts[1]))
+    yield
+
+
+@contextlib.contextmanager
+def stop(ctx, config):
+    """
+    Stop ceph daemons
+    For example::
+      tasks:
+      - ceph.stop: [mds.*]
+      tasks:
+      - ceph.stop: [osd.0, osd.2]
+      tasks:
+      - ceph.stop:
+          daemons: [osd.0, osd.2]
+    """
+    if config is None:
+        config = {}
+    elif isinstance(config, list):
+        config = {'daemons': config}
+
+    daemons = ctx.daemons.resolve_role_list(config.get('daemons', None), CEPH_ROLE_TYPES, True)
+    for role in daemons:
+        cluster, type_, id_ = teuthology.split_role(role)
+        ctx.daemons.get_daemon(type_, id_, cluster).stop()
+
+    yield
+
+
+@contextlib.contextmanager
+def wait_for_failure(ctx, config):
+    """
+    Wait for a failure of a ceph daemon
+    For example::
+      tasks:
+      - ceph.wait_for_failure: [mds.*]
+      tasks:
+      - ceph.wait_for_failure: [osd.0, osd.2]
+      tasks:
+      - ceph.wait_for_failure:
+          daemons: [osd.0, osd.2]
+    """
+    if config is None:
+        config = {}
+    elif isinstance(config, list):
+        config = {'daemons': config}
+
+    daemons = ctx.daemons.resolve_role_list(config.get('daemons', None), CEPH_ROLE_TYPES, True)
+    for role in daemons:
+        cluster, type_, id_ = teuthology.split_role(role)
+        try:
+            ctx.daemons.get_daemon(type_, id_, cluster).wait()
+        except:
+            log.info('Saw expected daemon failure.  Continuing.')
+            pass
+        else:
+            raise RuntimeError('daemon %s did not fail' % role)
+
+    yield
+
+
+def validate_config(ctx, config):
+    """
+    Perform some simple validation on task configuration.
+    Raises exceptions.ConfigError if an error is found.
+    """
+    # check for osds from multiple clusters on the same host
+    for remote, roles_for_host in ctx.cluster.remotes.items():
+        last_cluster = None
+        last_role = None
+        for role in roles_for_host:
+            role_cluster, role_type, _ = teuthology.split_role(role)
+            if role_type != 'osd':
+                continue
+            if last_cluster and last_cluster != role_cluster:
+                msg = "Host should not have osds (%s and %s) from multiple clusters" % (
+                    last_role, role)
+                raise exceptions.ConfigError(msg)
+            last_cluster = role_cluster
+            last_role = role
+
+
+@contextlib.contextmanager
+def task(ctx, config):
+    """
+    Set up and tear down a Ceph cluster.
+    For example::
+        tasks:
+        - ceph:
+        - interactive:
+    You can also specify what branch to run::
+        tasks:
+        - ceph:
+            branch: foo
+    Or a tag::
+        tasks:
+        - ceph:
+            tag: v0.42.13
+    Or a sha1::
+        tasks:
+        - ceph:
+            sha1: 1376a5ab0c89780eab39ffbbe436f6a6092314ed
+    Or a local source dir::
+        tasks:
+        - ceph:
+            path: /home/sage/ceph
+    To capture code coverage data, use::
+        tasks:
+        - ceph:
+            coverage: true
+    To use btrfs, ext4, or xfs on the target's scratch disks, use::
+        tasks:
+        - ceph:
+            fs: xfs
+            mkfs_options: [-b,size=65536,-l,logdev=/dev/sdc1]
+            mount_options: [nobarrier, inode64]
+    Note, this will cause the task to check the /scratch_devs file on each node
+    for available devices.  If no such file is found, /dev/sdb will be used.
+    To run some daemons under valgrind, include their names
+    and the tool/args to use in a valgrind section::
+        tasks:
+        - ceph:
+          valgrind:
+            mds.1: --tool=memcheck
+            osd.1: [--tool=memcheck, --leak-check=no]
+    Those nodes which are using memcheck or valgrind will get
+    checked for bad results.
+    To adjust or modify config options, use::
+        tasks:
+        - ceph:
+            conf:
+              section:
+                key: value
+    For example::
+        tasks:
+        - ceph:
+            conf:
+              mds.0:
+                some option: value
+                other key: other value
+              client.0:
+                debug client: 10
+                debug ms: 1
+    By default, the cluster log is checked for errors and warnings,
+    and the run marked failed if any appear. You can ignore log
+    entries by giving a list of egrep compatible regexes, i.e.:
+        tasks:
+        - ceph:
+            log-whitelist: ['foo.*bar', 'bad message']
+    To run multiple ceph clusters, use multiple ceph tasks, and roles
+    with a cluster name prefix, e.g. cluster1.client.0. Roles with no
+    cluster use the default cluster name, 'ceph'. OSDs from separate
+    clusters must be on separate hosts. Clients and non-osd daemons
+    from multiple clusters may be colocated. For each cluster, add an
+    instance of the ceph task with the cluster name specified, e.g.::
+        roles:
+        - [mon.a, osd.0, osd.1]
+        - [backup.mon.a, backup.osd.0, backup.osd.1]
+        - [client.0, backup.client.0]
+        tasks:
+        - ceph:
+            cluster: ceph
+        - ceph:
+            cluster: backup
+    :param ctx: Context
+    :param config: Configuration
+    """
+    import pdb;pdb.set_trace()
+    if config is None:
+        config = {}
+    assert isinstance(config, dict), \
+        "task ceph only supports a dictionary for configuration"
+
+    overrides = ctx.config.get('overrides', {})
+    liyan_test = teuthology.deep_merge(config, overrides.get('ceph', {}))
+
+    first_ceph_cluster = False
+    if not hasattr(ctx, 'daemons'):
+        first_ceph_cluster = True
+        ctx.daemons = DaemonGroup()
+
+    testdir = teuthology.get_testdir(ctx)
+    if config.get('coverage'):
+        coverage_dir = '{tdir}/archive/coverage'.format(tdir=testdir)
+        log.info('Creating coverage directory...')
+        run.wait(
+            ctx.cluster.run(
+                args=[
+                    'install', '-d', '-m0755', '--',
+                    coverage_dir,
+                ],
+                wait=False,
+            )
+        )
+
+    if 'cluster' not in config:
+        # Liyan add this default cluster is not 'ceph'
+        roles = ctx.config['roles']
+        for role in roles[0]:
+            config['cluster'], _, _, = teuthology.split_role(role)
+            if config['cluster'] == 'ceph':
+                continue
+            else:
+                break
+            
+    validate_config(ctx, config)
+
+    subtasks = []
+    if first_ceph_cluster:
+        # these tasks handle general log setup and parsing on all hosts,
+        # so they should only be run once
+        #Peng debug temp comment out the unnessecarry subtasks
+        subtasks = [
+            lambda: ceph_log(ctx=ctx, config=None),
+            lambda: valgrind_post(ctx=ctx, config=config),
+        ]
+        #subtasks = []
+
+    import pdb;pdb.set_trace()
+    subtasks += [
+        lambda: cluster(ctx=ctx, config=dict(
+            conf=config.get('conf', {}),
+            # Liyan debug
+            #fs=config.get('fs', 'xfs'),
+            fs=config.get('fs',None),
+            mkfs_options=config.get('mkfs_options', None),
+            mount_options=config.get('mount_options', None),
+            block_journal=config.get('block_journal', None),
+            tmpfs_journal=config.get('tmpfs_journal', None),
+            log_whitelist=config.get('log-whitelist', []),
+            # Liyan add blacklist new
+            log_blacklist=config.get('log-blacklist',[]),
+            cpu_profile=set(config.get('cpu_profile', []),),
+            cluster=config['cluster'],
+        )),
+        #Peng debug
+        lambda: run_daemon(ctx=ctx, config=config, type_='mon'),
+        lambda: run_daemon(ctx=ctx, config=config, type_='mgr'),
+        #lambda: crush_setup(ctx=ctx, config=config),
+        lambda: run_daemon(ctx=ctx, config=config, type_='osd'),
+        #lambda: cephfs_setup(ctx=ctx, config=config),
+        lambda: run_daemon(ctx=ctx, config=config, type_='mds'),
+    ]
+
+    with contextutil.nested(*subtasks):
+        first_mon = teuthology.get_first_mon(ctx, config, config['cluster'])
+        (mon,) = ctx.cluster.only(first_mon).remotes.iterkeys()
+        if not hasattr(ctx, 'managers'):
+            ctx.managers = {}
+        ctx.managers[config['cluster']] = CephManager(
+            mon,
+            ctx=ctx,
+            logger=log.getChild('ceph_manager.' + config['cluster']),
+            cluster=config['cluster'],
+        )
+
+        try:
+            if config.get('wait-for-healthy', True):
+                log.info('Liyan debug cluster name is {cluster_name}'.format(cluster_name=config['cluster']))
+                healthy(ctx=ctx, config=dict(cluster=config['cluster']))
+
+            yield
+        finally:
+            if config.get('wait-for-scrub', True):
+                osd_scrub_pgs(ctx, config)
+
+# Liyan move this function to there
+def first_in_ceph_log(remote, file_path, pattern, excludes):
+    """
+    Find the first occurence of the pattern specified in the Ceph log,
+    Returns None if none found.
+    :param pattern: Pattern scanned for.
+    :param excludes: Patterns to ignore.
+    :return: First line of text (or None if not found)
+    """
+    import pdb;pdb.set_trace()
+    args = [
+        'sudo',
+        'egrep',
+        pattern,
+    ]
+    pyscript_dir = """
+ import os
+ os.path.exists({file_path})
+    """.format(file_path=file_path)
+
+    proc_dir = remote.run(
+        args = [
+            'python',
+            '-c',
+            pyscript_dir
+        ]                                                                                                                                                     
+    )                                                                                                                                                         
+    if proc_dir == 0:                                                                                                                                         
+        args = args.extend(file_path)                                                                                                                    
+    else:                                                                                                                                                     
+        args = args.extend(file_path)                                                                                                                         
+    if excludes != '':                                                                                                                                        
+        for exclude in excludes:                                                                                                                              
+            args = args.extend([run.Raw('|'),'egrep','-v',exclude])                                                                                            
+    r = remote.run(                                                                                                                                      
+        stdout=StringIO(),                                                                                                                                    
+        args = args,                                                                                                                                          
+    )                                                                                                                                                         
+    stdout = r.stdout.getvalue()                                                                                                                              
+    if stdout != '':                                                                                                                                          
+        return stdout                                                                                                                                         
+    return None  

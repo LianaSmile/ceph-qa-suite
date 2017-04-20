@@ -1,0 +1,16 @@
+check-locks: false
+nuke-on-error: false
+use_existing_cluster: true
+suite_path: /home/teuthology/src/ceph-qa-suite_master/
+cluster: xtao
+roles:
+- [client.1, xtao.osd.1, xtao.osd.3, xtao.mds.xt2 ]
+- [xtao.mon.xt1, xtao.osd.0, xtao.osd.2, xtao.mds.xt1, client.0]
+
+log-rotate:
+  ceph-mds: 1.0G
+  ceph-osd: 2.5G
+#targets:
+#  root@plana001.ceph.com: password nasadmin
+#  root@plana002.ceph.com: password nasadmin 
+  

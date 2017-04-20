@@ -1,0 +1,115 @@
+branch: master
+check-locks: false
+cluster: xtao
+email: null
+job_id: '10'
+last_in_suite: false
+log-rotate:
+  ceph-mds: 1.0G
+  ceph-osd: 2.5G
+machine_type: plana
+name: test_xtao_deplogy
+nuke-on-error: false
+
+os_type: centos
+os_version: "7.1"
+overrides:
+  admin_socket:
+    branch: master
+  ceph:
+    cluster: xtao
+    conf:
+      client:
+        debug client: 2
+        debug ms: 1
+      mds:
+        debug mds: 2
+        debug ms: 1
+      mon:
+        debug mon: 20
+        debug ms: 1
+        debug paxos: 20
+      osd:
+        debug filestore: 20
+        debug journal: 20
+        debug ms: 1
+        debug osd: 25
+        osd sloppy crc: true
+    fs: xfs
+    log-whitelist:
+    - slow request
+  ceph-deploy:
+    conf:
+      client:
+        log file: /var/log/ceph/xtao-$name.$pid.log
+      mon:
+        debug mon: 1
+        debug ms: 20
+        debug paxos: 20
+        osd default pool size: 2
+  workunit: {}
+owner: test_liyan_deploy@ubuntu
+priority: 1000
+
+
+roles:
+- [client.1,xtao.osd.1]
+- [ client.0, xtao.osd.0]
+
+
+tasks:
+# init disk
+#- pexec: 
+#    client.0:
+#      - xd mon add xt1
+- pexec:
+    all:
+#      - cd /root/
+#      - sh xtao_init.sh
+      - for i in $(xtcli disk list |grep HDD |awk '{print $4}');do xd disk clear $i;xtcli disk init -y $i;done 
+- pexec:
+    client.0:
+      - for i in $(xtcli disk list |grep HDD |awk '{print $4}') ;do xtcli disk join -y -o $i;done
+    client.1:
+      - for i in $(xtcli disk list |grep HDD |awk '{print $4}') ;do xtcli disk join -y -o $i;done
+
+# init domain
+- pexec:
+    client.0: 
+      - xtcli domain show -r tree -t xtao
+      - echo yes | xtcli domain commit -r tree -t xtao
+
+# mount fs
+- pexec:
+    client.0:
+#      - xtcli pool destroy rbd -y
+      - xtcli pool create -t xtao -o hdd -n 2 cephfs_metadata
+      - xtcli pool create -t xtao -o hdd -n 2 cephfs_data
+      - xtcli fs create -t xtao cephfs_metadata cephfs_data xt1 xt2
+#      - mkdir -p /mnt/test_mount/
+#      - ceph-fuse --name client.0 /mnt/test_mount --id 0 --cluster xtao 
+
+# irods
+#- pexec:
+#    client.0:
+#      - xtcli pool create -t xtao -o hdd -n 1 dbpool
+#      - xd postgresql create dbpool
+#      - xd postgresql start
+#      - xd irods create xt1
+#      - xd irods start
+#
+## mh
+#- pexec:
+#    client.0:
+#      - xd mh publish -t xtao xt1 xt1 irods
+#      - xd mh start -t xtao
+
+teuthology_branch: master
+tube: plana
+use_existing_cluster: true
+verbose: false
+worker_log: /home/teuthworker/archive/worker_logs/worker_liyan_xtao
+
+targets:
+  root@plana001.ceph.com: passwd nasadmin
+  root@plana002.ceph.com: passwd nasadmin

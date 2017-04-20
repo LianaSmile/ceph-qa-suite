@@ -1,0 +1,14 @@
+use_existing_cluster: true
+check-locks: false
+nuke-on-error: false
+suite_path: /home/teuthology/src/ceph-qa-suite-master/
+cluster: xtao
+roles:
+- [client.1, xtao.osd.1, xtao.mds.xt2 ]
+- [xtao.mon.xt1, xtao.osd.0, xtao.mds.xt1, client.0]
+
+log-rotate:
+  ceph-mds: 1G
+  ceph-osd: 1G
+ceph:
+  conf:
